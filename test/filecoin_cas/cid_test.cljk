@@ -1,0 +1,38 @@
+(ns filecoin-cas.cid-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [multiformats.core :as mf]
+            [filecoin-cas.cid :as cid]))
+
+(defn- bytes-of [s] (.encode (js/TextEncoder.) s))
+
+(deftest fast-sha256-installs-and-agrees
+  (testing "the host digest is installed and yields the same CID as portable"
+    (let [b (bytes-of "hello filecoin")
+          portable (mf/cidv1-raw b)]
+      (is (= :installed (cid/install-fast-sha256!)))
+      (is (= portable (mf/cidv1-raw b))))))
+
+(deftest matches-raw-and-dag-cbor
+  (let [b (bytes-of "artifact bytes")]
+    (cid/install-fast-sha256!)
+    (is (cid/matches? (mf/cidv1-raw b) b))
+    (is (cid/matches? (mf/cidv1-dag-cbor b) b))))
+
+(deftest rejects-wrong-bytes-and-malformed-cids
+  (let [b (bytes-of "one") c (mf/cidv1-raw b)]
+    (cid/install-fast-sha256!)
+    (is (not (cid/matches? c (bytes-of "two"))))
+    (is (not (cid/matches? "Qm123" b)))
+    (is (not (cid/matches? nil b)))
+    (is (not (cid/matches? "../etc/passwd" b)))))
+
+(deftest verify-throws-with-reason
+  (let [b (bytes-of "x")]
+    (cid/install-fast-sha256!)
+    (is (= b (cid/verify! (mf/cidv1-raw b) b)))
+    (is (= :cid-mismatch
+           (try (cid/verify! (mf/cidv1-raw b) (bytes-of "y"))
+                (catch :default e (:reason (ex-data e))))))
+    (is (= :spool-corrupt
+           (try (cid/verify! (mf/cidv1-raw b) (bytes-of "y") :spool-corrupt)
+                (catch :default e (:reason (ex-data e))))))))

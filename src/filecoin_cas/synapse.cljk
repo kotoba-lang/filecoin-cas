@@ -1,0 +1,96 @@
+(ns filecoin-cas.synapse
+  "The one JS-interop boundary to Filecoin Onchain Cloud (Synapse SDK 2.x).
+
+  Everything that touches @filoz/synapse-sdk, viem or bigint lives here; the
+  rest of filecoin-cas stays plain data. Every function returns a promise.
+  Private keys are accepted as 0x-hex strings and are never logged or
+  returned."
+  (:require ["@filoz/synapse-sdk" :as sdk]
+            ["@filoz/synapse-core/chains" :as chains]
+            ["@filoz/synapse-core/client" :as core-client]
+            ["viem" :as viem]
+            ["viem/accounts" :as accounts]
+            [promesa.core :as p]))
+
+(def chain-ids {:mainnet 314 :calibration 314159})
+
+(defn generate-private-key
+  "A fresh random 0x-hex secp256k1 key. Testnet/throwaway use only unless the
+  caller persists it deliberately."
+  []
+  (accounts/generatePrivateKey))
+
+(defn make-synapse
+  "Build a Synapse instance. `:chain` is :calibration or :mainnet;
+  `:private-key` is 0x-hex; `:source` namespaces datasets per application."
+  [{:keys [chain private-key source]}]
+  (let [id (or (get chain-ids chain)
+               (throw (ex-info "filecoin-cas: unknown chain" {:chain chain})))
+        fchain (chains/getChain id)
+        account (accounts/privateKeyToAccount private-key)
+        client (viem/createWalletClient
+                 #js {:account account
+                      :chain fchain
+                      :transport (core-client/getTransport fchain)})]
+    (sdk/Synapse. #js {:client client :source (or source "filecoin-cas")})))
+
+(defn address
+  "The 0x address that pays for and owns the stored pieces."
+  [synapse]
+  (.. synapse -client -account -address))
+
+(defn wallet-balances
+  "Wallet-side balances (not yet deposited into Filecoin Pay), in base units
+  as decimal strings."
+  [synapse]
+  (p/let [fil (.walletBalance (.-payments synapse))
+          usdfc (.walletBalance (.-payments synapse) #js {:token "USDFC"})]
+    {:fil (str fil) :usdfc (str usdfc)}))
+
+(def default-runway-epochs
+  "Slack beyond the required lockup, in epochs (30 s each; 86400 = 30 days).
+  Without it the account sits at exactly its lockup, cannot settle, and adding
+  a piece to an existing dataset fails with LockupNotSettledRateChangeNotAllowed."
+  86400)
+
+(defn prepare!
+  "Ensure the Filecoin Pay account can cover storing pieces of `piece-sizes`
+  (bytes) with `runway-epochs` of slack. Deposits and approves the operator
+  when needed. Resolves to {:ready? bool :deposited (decimal string)
+  :tx hash-or-nil}."
+  ([synapse piece-sizes] (prepare! synapse piece-sizes default-runway-epochs))
+  ([synapse piece-sizes runway-epochs]
+   (p/let [res (.prepare (.-storage synapse)
+                         #js {:pieceSizes (clj->js (mapv js/BigInt piece-sizes))
+                              :extraRunwayEpochs (js/BigInt runway-epochs)})
+           tx (.-transaction res)]
+     (if (nil? tx)
+       {:ready? true :deposited "0" :tx nil}
+       (p/let [sent (.execute tx)]
+         {:ready? true
+          :deposited (str (.-depositAmount tx))
+          :tx (.-hash sent)})))))
+
+(defn upload!
+  "Store `bytes` (Uint8Array) as one piece. `metadata` is a string->string map
+  recorded with the piece (use it to keep the source CID). Resolves to
+  {:piece-cid str :size n :complete? bool :copies [{:provider-id :data-set-id
+  :piece-id :url}]}; ids are decimal strings."
+  [synapse bytes metadata]
+  (p/let [r (.upload (.-storage synapse) bytes
+                     #js {:pieceMetadata (clj->js (or metadata {}))})]
+    {:piece-cid (str (.-pieceCid r))
+     :size (.-size r)
+     :complete? (.-complete r)
+     :copies (mapv (fn [c] {:provider-id (str (.-providerId c))
+                            :data-set-id (str (.-dataSetId c))
+                            :piece-id (str (.-pieceId c))
+                            :url (.-retrievalUrl c)})
+                   (.-copies r))}))
+
+(defn download
+  "Fetch a piece by PieceCID string. Resolves to a Uint8Array. The SDK checks
+  the bytes against the PieceCID; callers must still verify any higher-level
+  CID (see filecoin-cas verification, stage 2)."
+  [synapse piece-cid]
+  (.download (.-storage synapse) #js {:pieceCid piece-cid}))

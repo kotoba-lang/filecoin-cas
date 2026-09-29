@@ -1,0 +1,117 @@
+(ns filecoin-cas.engine
+  "The Filecoin cold tier: enqueue verified objects, drain the queue to
+  Filecoin, fetch them back by CID.
+
+  Transport is injected so the whole thing is testable without a network:
+
+    :upload!   (fn [bytes metadata]) -> promise of {:piece-cid :size
+               :complete? :copies}       (filecoin-cas.synapse/upload! curried)
+    :download  (fn [piece-cid]) -> promise of Uint8Array
+
+  Every byte in or out is checked against its CID (filecoin-cas.cid)."
+  (:require [promesa.core :as p]
+            [filecoin-cas.cid :as cid]
+            [filecoin-cas.index :as index]
+            [filecoin-cas.state :as state]))
+
+(defn- now [cas] ((:now-fn cas)))
+
+(defn- attempt
+  "Run `f` (a thunk that may throw synchronously or return a promise) and
+  always answer with a promise. A synchronous throw inside a promesa `p/let`
+  body can escape before any `p/catch` is attached; routing through here turns
+  every failure into a rejection."
+  [f]
+  (js/Promise. (fn [resolve reject]
+                 (try (resolve (f))
+                      (catch :default e (reject e))))))
+
+(defn- commit!
+  "Apply `f` to the index and persist the result."
+  [cas f & args]
+  (let [idx (apply swap! (:idx cas) f args)]
+    (state/save-index! (:dir cas) idx)
+    idx))
+
+(defn open
+  "Open the tier rooted at `dir`. Spool files with no index entry (a crash
+  between writing the spool and saving the index) are verified and queued, and
+  a corrupt one is dropped rather than retried forever."
+  [{:keys [dir upload! download now-fn]}]
+  (let [cas {:dir dir :upload! upload! :download download
+             :now-fn (or now-fn #(js/Date.now))
+             :idx (atom (state/load-index dir))
+             :draining (atom false)}]
+    (doseq [c (state/spooled-cids dir)
+            :when (nil? (index/lookup @(:idx cas) c))]
+      (let [bytes (state/spool-get dir c)]
+        (if (cid/matches? c bytes)
+          (commit! cas index/enqueue c (.-length bytes) (now cas))
+          (state/spool-delete! dir c))))
+    cas))
+
+(defn enqueue!
+  "Verify `bytes` against `cid`, spool them, and queue the upload. Synchronous
+  and cheap so a caller's `put!` never waits on Filecoin. Returns the entry."
+  [cas c bytes]
+  (cid/verify! c bytes :cid-mismatch)
+  (when-not (index/lookup @(:idx cas) c)
+    (state/spool-put! (:dir cas) c bytes))
+  (commit! cas index/enqueue c (.-length bytes) (now cas))
+  (index/lookup @(:idx cas) c))
+
+(defn status [cas c] (index/lookup @(:idx cas) c))
+
+(defn- upload-one! [cas c]
+  (let [bytes (state/spool-get (:dir cas) c)]
+    (if (nil? bytes)
+      (do (commit! cas index/mark-failed c "spool-missing" (now cas))
+          (p/resolved {:cid c :ok false :error "spool-missing"}))
+      (-> (attempt
+            (fn []
+              (cid/verify! c bytes :spool-corrupt)
+              (p/then ((:upload! cas) bytes {"cid" c "kind" "cas"})
+                      (fn [res]
+                        (when-not (seq (:copies res))
+                          (throw (ex-info "filecoin-cas: upload returned no copies"
+                                          {:reason :no-copies})))
+                        (commit! cas index/mark-stored c res (now cas))
+                        (state/spool-delete! (:dir cas) c)
+                        {:cid c :ok true :piece-cid (:piece-cid res)}))))
+          (p/catch (fn [e]
+                     (let [msg (or (.-shortMessage e) (.-message e) (str e))]
+                       (commit! cas index/mark-failed c msg (now cas))
+                       {:cid c :ok false :error msg})))))))
+
+(defn drain!
+  "Upload due objects one at a time (`limit` per call, default 10). Resolves to
+  a vector of per-object results. A second concurrent call returns [] rather
+  than uploading the same object twice."
+  ([cas] (drain! cas 10))
+  ([cas limit]
+   (if-not (compare-and-set! (:draining cas) false true)
+     (p/resolved [])
+     (-> (p/loop [todo (index/due @(:idx cas) (now cas) limit)
+                  out []]
+           (if (empty? todo)
+             out
+             (p/let [r (upload-one! cas (first todo))]
+               (p/recur (rest todo) (conj out r)))))
+         (p/finally (fn [_ _] (reset! (:draining cas) false)))))))
+
+(defn fetch
+  "Bytes for `cid`, or nil when the tier has never seen it. Prefers the local
+  spool; otherwise downloads the stored piece. Whatever comes back is verified
+  against the CID before it is returned. Always a promise; failures reject with
+  an ex-info whose :reason is :spool-corrupt or :fetched-bytes-cid-mismatch."
+  [cas c]
+  (attempt
+    (fn []
+      (let [spooled (state/spool-get (:dir cas) c)
+            entry (index/lookup @(:idx cas) c)]
+        (cond
+          spooled (cid/verify! c spooled :spool-corrupt)
+          (and entry (= :stored (:state entry)))
+          (p/then ((:download cas) (:piece-cid entry))
+                  #(cid/verify! c % :fetched-bytes-cid-mismatch))
+          :else nil)))))

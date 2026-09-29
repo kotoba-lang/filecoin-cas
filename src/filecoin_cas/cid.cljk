@@ -1,0 +1,50 @@
+(ns filecoin-cas.cid
+  "CID verification for objects that pass through the Filecoin tier.
+
+  Synapse only proves bytes against a PieceCID (CommP). The identity murakumo
+  and yataverse use is a CIDv1 (`baf...`, raw or dag-cbor, sha2-256), so every
+  byte that enters or leaves this tier is re-checked against that CID here.
+  Same acceptance rule as murakumo.artifact-store."
+  (:require ["node:crypto" :as crypto]
+            [multiformats.core :as mf]))
+
+(defn valid-cid? [cid]
+  (boolean (and (string? cid) (re-matches #"baf[a-z2-7]+" cid))))
+
+(defn install-fast-sha256!
+  "On ClojureScript multiformats defaults to a portable SHA-256 that is orders
+  of magnitude slower than the host's. Install node:crypto's, once. The seam
+  proves the candidate against the portable digest before accepting it."
+  []
+  (when (= :portable (mf/sha256-provider))
+    (mf/install-sha256!
+      (fn [b]
+        (js/Uint8Array. (.digest (.update (.createHash crypto "sha256") b))))))
+  (mf/sha256-provider))
+
+(defn matches?
+  "True when `cid` is the raw or dag-cbor CIDv1 of `bytes`. Hashes once."
+  [cid bytes]
+  (and (valid-cid? cid)
+       (let [mh (mf/multihash-sha256 bytes)]
+         (or (= cid (mf/cidv1 mf/codec-raw mh))
+             (= cid (mf/cidv1 mf/codec-dag-cbor mh))))))
+
+(defn verify!
+  "Return `bytes` when they match `cid`; otherwise throw with `reason`
+  (default :cid-mismatch) so callers can tell inbound from outbound faults."
+  ([cid bytes] (verify! cid bytes :cid-mismatch))
+  ([cid bytes reason]
+   (when-not (matches? cid bytes)
+     (throw (ex-info (str "filecoin-cas: " (name reason)) {:reason reason :cid cid})))
+   bytes))
+
+(defn error-reason
+  "The :reason of a filecoin-cas failure, however it arrived. Under nbb/SCI an
+  ex-info thrown inside a promise callback is re-wrapped as a :sci/error whose
+  original is the ex-cause, so walk the cause chain instead of reading
+  ex-data once."
+  [e]
+  (->> (iterate ex-cause e)
+       (take-while some?)
+       (some #(:reason (ex-data %)))))

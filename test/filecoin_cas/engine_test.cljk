@@ -1,0 +1,160 @@
+(ns filecoin-cas.engine-test
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.test :refer [deftest is testing async]]
+            [promesa.core :as p]
+            [multiformats.core :as mf]
+            [filecoin-cas.cid :as cid]
+            [filecoin-cas.engine :as eng]
+            [filecoin-cas.state :as state]))
+
+(defn- bytes-of [s] (js/Uint8Array. (.encode (js/TextEncoder.) s)))
+(defn- cid-of [b] (cid/install-fast-sha256!) (mf/cidv1-raw b))
+(defn- tmpdir [] (.mkdtempSync fs (.join path (.tmpdir os) "fcas-")))
+(defn- reason [e] (cid/error-reason e))
+
+(defn- run-async [done pf]
+  (-> pf
+      (.catch (fn [e] (is (nil? e) (str "unexpected rejection: " (.-message e)))))
+      (.finally done)))
+
+(defn- fake-net
+  "In-memory Filecoin. `fail-first` rejects that many uploads before working;
+  `uploads` counts successful ones. `tamper?` makes downloads return other bytes."
+  [{:keys [fail-first tamper?] :or {fail-first 0}}]
+  (let [pieces (atom {}) uploads (atom 0) fails (atom fail-first)]
+    {:uploads uploads
+     :upload! (fn [bytes _meta]
+                (if (pos? @fails)
+                  (do (swap! fails dec) (js/Promise.reject (js/Error. "sp down")))
+                  (let [pc (str "piece-" (swap! uploads inc))]
+                    (swap! pieces assoc pc bytes)
+                    (p/resolved {:piece-cid pc :size (.-length bytes) :complete? true
+                                 :copies [{:provider-id "9" :data-set-id "1" :piece-id "0" :url "u"}]}))))
+     :download (fn [pc] (p/resolved (if tamper? (bytes-of "tampered") (get @pieces pc))))}))
+
+(defn- open-cas [dir net clock]
+  (eng/open {:dir dir :upload! (:upload! net) :download (:download net)
+             :now-fn #(deref clock)}))
+
+(deftest enqueue-rejects-mismatched-bytes-and-leaves-no-trace
+  (let [dir (tmpdir) cas (open-cas dir (fake-net {}) (atom 1000))
+        c (cid-of (bytes-of "real"))]
+    (is (= :cid-mismatch
+           (try (eng/enqueue! cas c (bytes-of "fake")) (catch :default e (reason e)))))
+    (is (nil? (eng/status cas c)))
+    (is (nil? (state/spool-get dir c)))))
+
+(deftest queued-object-is-served-from-spool-without-download
+  (async done
+    (let [dir (tmpdir) net (fake-net {}) cas (open-cas dir net (atom 1000))
+          b (bytes-of "spooled") c (cid-of b)]
+      (eng/enqueue! cas c b)
+      (run-async done
+        (p/let [got (eng/fetch cas c)]
+          (is (= (vec b) (vec got)))
+          (is (= 0 @(:uploads net))))))))
+
+(deftest drain-stores-then-fetch-downloads-and-verifies
+  (async done
+    (let [dir (tmpdir) net (fake-net {}) cas (open-cas dir net (atom 1000))
+          b (bytes-of "to filecoin") c (cid-of b)]
+      (eng/enqueue! cas c b)
+      (run-async done
+        (p/let [res (eng/drain! cas)
+                got (eng/fetch cas c)]
+          (is (= [true] (mapv :ok res)))
+          (is (= :stored (:state (eng/status cas c))))
+          (is (nil? (state/spool-get dir c)) "spool freed once stored")
+          (is (= (vec b) (vec got)) "read back through download"))))))
+
+(deftest failed-upload-backs-off-then-succeeds
+  (async done
+    (let [dir (tmpdir) clock (atom 1000) net (fake-net {:fail-first 1})
+          cas (open-cas dir net clock)
+          b (bytes-of "flaky") c (cid-of b)]
+      (eng/enqueue! cas c b)
+      (run-async done
+        (p/let [r1 (eng/drain! cas)]
+          (is (= [false] (mapv :ok r1)))
+          (is (= 1 (:attempts (eng/status cas c))))
+          (p/let [r2 (eng/drain! cas)]
+            (is (= [] r2) "still inside the backoff window")
+            (swap! clock + 10000)
+            (p/let [r3 (eng/drain! cas)]
+              (is (= [true] (mapv :ok r3)))
+              (is (= :stored (:state (eng/status cas c)))))))))))
+
+(deftest restart-keeps-queue-and-recovers-orphan-spool
+  (async done
+    (let [dir (tmpdir) clock (atom 1000) net (fake-net {})
+          cas1 (open-cas dir net clock)
+          b1 (bytes-of "queued before crash") c1 (cid-of b1)
+          b2 (bytes-of "spooled, index never saved") c2 (cid-of b2)
+          bad (bytes-of "corrupt orphan") cbad (cid-of (bytes-of "other"))]
+      (eng/enqueue! cas1 c1 b1)
+      (state/spool-put! dir c2 b2)
+      (state/spool-put! dir cbad bad)
+      (let [cas2 (open-cas dir net clock)]
+        (is (= :queued (:state (eng/status cas2 c1))))
+        (is (= :queued (:state (eng/status cas2 c2))) "orphan re-queued")
+        (is (nil? (eng/status cas2 cbad)) "corrupt orphan dropped")
+        (is (nil? (state/spool-get dir cbad)))
+        (run-async done
+          (p/let [res (eng/drain! cas2)]
+            (is (= [true true] (mapv :ok res)))
+            (is (= 2 @(:uploads net)))))))))
+
+(deftest stored-object-is-not-uploaded-twice
+  (async done
+    (let [dir (tmpdir) net (fake-net {}) cas (open-cas dir net (atom 1000))
+          b (bytes-of "once") c (cid-of b)]
+      (eng/enqueue! cas c b)
+      (run-async done
+        (p/let [_ (eng/drain! cas)]
+          (eng/enqueue! cas c b)
+          (p/let [res (eng/drain! cas)]
+            (is (= [] res))
+            (is (= 1 @(:uploads net)))))))))
+
+(deftest tampered-download-is-rejected
+  (async done
+    (let [dir (tmpdir) net (fake-net {:tamper? true}) cas (open-cas dir net (atom 1000))
+          b (bytes-of "genuine") c (cid-of b)]
+      (eng/enqueue! cas c b)
+      (run-async done
+        (p/let [_ (eng/drain! cas)]
+          (-> (eng/fetch cas c)
+              (p/then (fn [_] (is false "tampered bytes must not be returned")))
+              (p/catch (fn [e] (is (= :fetched-bytes-cid-mismatch (reason e)))))))))))
+
+(deftest unknown-cid-fetches-nil
+  (async done
+    (let [cas (open-cas (tmpdir) (fake-net {}) (atom 0))]
+      (run-async done
+        (p/let [got (eng/fetch cas (cid-of (bytes-of "never seen")))]
+          (is (nil? got)))))))
+
+(deftest concurrent-drain-does-not-double-upload
+  (async done
+    (let [dir (tmpdir) net (fake-net {}) cas (open-cas dir net (atom 1000))
+          b (bytes-of "race") c (cid-of b)]
+      (eng/enqueue! cas c b)
+      (run-async done
+        (p/let [[r1 r2] (p/all [(eng/drain! cas) (eng/drain! cas)])]
+          (is (= 1 @(:uploads net)))
+          (is (= 1 (count (concat r1 r2)))))))))
+
+(deftest upload-without-copies-is-a-failure
+  (async done
+    (let [dir (tmpdir) cas (eng/open {:dir dir
+                                       :upload! (fn [b _] (p/resolved {:piece-cid "p" :copies []}))
+                                       :download (fn [_] nil)
+                                       :now-fn (constantly 1000)})
+          b (bytes-of "no copies") c (cid-of b)]
+      (eng/enqueue! cas c b)
+      (run-async done
+        (p/let [res (eng/drain! cas)]
+          (is (= [false] (mapv :ok res)))
+          (is (= :queued (:state (eng/status cas c)))))))))
