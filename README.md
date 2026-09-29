@@ -123,3 +123,7 @@ control; never commit it, and prefer a scoped session key over the main key.
   before upload anything sensitive.
 - The faucet returns before its transactions are indexed; poll the balance
   rather than waiting on a receipt.
+
+## License
+
+Apache License 2.0 (see `LICENSE`), the same as the other kotoba-lang libraries.
