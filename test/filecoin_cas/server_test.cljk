@@ -110,3 +110,85 @@
   (is (= :insecure-bind
          (try (srv/start! (memory-cas) {:host "0.0.0.0" :port 0})
               (catch :default e (cid/error-reason e))))))
+
+;; ---- streaming ---------------------------------------------------------------
+
+(defn- temp-leftovers [cas]
+  (let [dirs [(.join path (:dir cas) "spool") (.join path (:dir cas) "fetch")]]
+    (vec (for [d dirs :when (.existsSync fs d)
+               f (.readdirSync fs d) :when (.startsWith f ".tmp-")]
+           f))))
+
+(defn- leftovers-after-settling
+  "Temp files still present after waiting up to 3 s for the server's own
+  cleanup, which runs just after the client sees the last byte."
+  [cas]
+  (js/Promise.
+    (fn [resolve _]
+      (letfn [(check [tries]
+                (let [left (temp-leftovers cas)]
+                  (if (or (empty? left) (zero? tries))
+                    (resolve left)
+                    (js/setTimeout #(check (dec tries)) 100))))]
+        (check 30)))))
+
+(deftest a-large-object-streams-in-and-out
+  (async done
+    (let [cas (memory-cas)
+          b (let [x (js/Buffer.alloc (* 16 1024 1024))]
+              (dotimes [i (.-length x)] (aset x i (mod (* i 31) 256)))
+              (js/Uint8Array. x))
+          c (cid-of b)]
+      (run-async done
+        (with-server cas {}
+          (fn [base]
+            (p/let [put (req base "PUT" (str "/obj/" c) {:body b})
+                    got (req base "GET" (str "/obj/" c))
+                    _ (eng/drain! cas)
+                    from-tier (req base "GET" (str "/obj/" c))
+                    left (leftovers-after-settling cas)]
+              (is (= 202 (:status put)))
+              (is (= (.-length b) (.-length (:body got))))
+              (is (= (vec (.subarray b 0 4096)) (vec (.subarray (:body got) 0 4096))))
+              (is (= (vec (.subarray b (- (.-length b) 4096)))
+                     (vec (.subarray (:body from-tier) (- (.-length b) 4096))))
+                  "served after the spool is gone, from the downloaded temp file")
+              (is (empty? left) (str "no temp file outlives a request: " (pr-str left))))))))))
+
+(deftest failed-uploads-leave-no-temp-files
+  (async done
+    (let [cas (memory-cas) real (bytes-of "the genuine bytes") c (cid-of real)
+          big (js/Uint8Array. (* 64 1024))]
+      (run-async done
+        (with-server cas {:max-object-bytes 1024}
+          (fn [base]
+            (p/let [mismatch (req base "PUT" (str "/obj/" c) {:body (bytes-of "not the bytes")})
+                    ;; no Content-Length: the limit is enforced while streaming
+                    chunked (js/fetch (str base "/obj/" c)
+                                      #js {:method "PUT" :duplex "half"
+                                           :body (js/ReadableStream.
+                                                   #js {:start (fn [controller]
+                                                                 (.enqueue controller big)
+                                                                 (.close controller))})})]
+              (is (= 422 (:status mismatch)))
+              (is (= 413 (.-status chunked)) "over the limit even without a declared length")
+              (is (nil? (eng/status cas c)) "nothing was queued")
+              (is (empty? (temp-leftovers cas)) "both temp files were removed"))))))))
+
+(deftest a-known-cid-is-answered-without-reading-the-body
+  (async done
+    (let [cas (memory-cas) b (bytes-of "the first, verified copy") c (cid-of b)]
+      (run-async done
+        (with-server cas {}
+          (fn [base]
+            (p/let [first-put (req base "PUT" (str "/obj/" c) {:body b})
+                    ;; a body that does NOT hash to the CID is ignored, not stored
+                    again (req base "PUT" (str "/obj/" c) {:body (bytes-of "different bytes")})
+                    got (req base "GET" (str "/obj/" c))
+                    _ (eng/drain! cas)
+                    stored (req base "PUT" (str "/obj/" c) {:body b})]
+              (is (= 202 (:status first-put)))
+              (is (= 202 (:status again)) "still queued: idempotent by CID")
+              (is (= (vec b) (vec (:body got))) "what is served is what was verified")
+              (is (= 200 (:status stored)) "and 200 once stored")
+              (is (empty? (temp-leftovers cas))))))))))

@@ -5,7 +5,10 @@
   rest of filecoin-cas stays plain data. Every function returns a promise.
   Private keys are accepted as 0x-hex strings and are never logged or
   returned."
-  (:require ["@filoz/synapse-sdk" :as sdk]
+  (:require ["node:fs" :as fs]
+            ["node:stream" :as stream]
+            ["node:stream/promises" :as stream-promises]
+            ["@filoz/synapse-sdk" :as sdk]
             ["@filoz/synapse-core/chains" :as chains]
             ["@filoz/synapse-core/client" :as core-client]
             ["viem" :as viem]
@@ -71,22 +74,39 @@
           :deposited (str (.-depositAmount tx))
           :tx (.-hash sent)})))))
 
+(defn- upload-result [r]
+  {:piece-cid (str (.-pieceCid r))
+   :size (.-size r)
+   :complete? (.-complete r)
+   :copies (mapv (fn [c] {:provider-id (str (.-providerId c))
+                          :data-set-id (str (.-dataSetId c))
+                          :piece-id (str (.-pieceId c))
+                          :url (.-retrievalUrl c)})
+                 (.-copies r))})
+
 (defn upload!
   "Store `bytes` (Uint8Array) as one piece. `metadata` is a string->string map
   recorded with the piece (use it to keep the source CID). Resolves to
   {:piece-cid str :size n :complete? bool :copies [{:provider-id :data-set-id
-  :piece-id :url}]}; ids are decimal strings."
+  :piece-id :url}]}; ids are decimal strings. For anything large use
+  `upload-file!`: handing the SDK a Uint8Array makes it copy the bytes."
   [synapse bytes metadata]
   (p/let [r (.upload (.-storage synapse) bytes
                      #js {:pieceMetadata (clj->js (or metadata {}))})]
-    {:piece-cid (str (.-pieceCid r))
-     :size (.-size r)
-     :complete? (.-complete r)
-     :copies (mapv (fn [c] {:provider-id (str (.-providerId c))
-                            :data-set-id (str (.-dataSetId c))
-                            :piece-id (str (.-pieceId c))
-                            :url (.-retrievalUrl c)})
-                   (.-copies r))}))
+    (upload-result r)))
+
+(defn upload-file!
+  "Stream the file at `path` to Filecoin as one piece without reading it into
+  memory: the SDK sends it as a web stream and computes the PieceCID as the
+  bytes pass. Same result shape as `upload!`. `size` is accepted for symmetry
+  with the engine's transport contract; the SDK derives the length itself."
+  [synapse path _size metadata]
+  (let [opts #js {:pieceMetadata (clj->js (or metadata {}))}]
+    (-> (.open (.-promises fs) path "r")
+        (.then (fn [fh]
+                 (-> (.upload (.-storage synapse) (.readableWebStream fh) opts)
+                     (.then upload-result)
+                     (.finally (fn [] (.close fh)))))))))
 
 (defn download
   "Fetch a piece by PieceCID string. Resolves to a Uint8Array. The SDK checks
@@ -94,3 +114,43 @@
   CID (see filecoin-cas verification, stage 2)."
   [synapse piece-cid]
   (.download (.-storage synapse) #js {:pieceCid piece-cid}))
+
+(def max-fallback-bytes
+  "Largest object the SDK's in-memory download may be used for when no stored
+  copy URL works."
+  (* 64 1024 1024))
+
+(defn- stream-url-to-file!
+  "GET an https `url` and stream the body into `dest` (mode 0600)."
+  [url dest]
+  (when-not (re-matches #"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/.*" (str url))
+    (throw (ex-info "filecoin-cas: retrieval URL must be https" {:reason :insecure-url})))
+  (-> (js/fetch url #js {:signal (.timeout js/AbortSignal 3600000)})
+      (.then (fn [res]
+               (when-not (.-ok res)
+                 (throw (ex-info (str "filecoin-cas: retrieval HTTP " (.-status res))
+                                 {:reason :retrieval-http :status (.-status res)})))
+               (.pipeline stream-promises
+                          (.fromWeb (.-Readable stream) (.-body res))
+                          (.createWriteStream fs dest #js {:mode 0600 :flags "w"}))))))
+
+(defn download-to-file!
+  "Stream the piece described by index `entry` ({:piece-cid :size :copies}) into
+  the file `dest` without holding it in memory. Tries each stored copy's
+  retrieval URL in turn; only when none works, and the object is small, falls
+  back to the SDK's in-memory `download`. The caller verifies the bytes against
+  its CID (the engine does)."
+  [synapse entry dest]
+  (letfn [(fallback []
+            (if (<= (or (:size entry) 0) max-fallback-bytes)
+              (.then (download synapse (:piece-cid entry))
+                     (fn [bytes] (.writeFileSync fs dest bytes #js {:mode 0600})))
+              (js/Promise.reject
+                (ex-info "filecoin-cas: no stored copy could be retrieved"
+                         {:reason :no-retrievable-copy}))))
+          (try-urls [urls]
+            (if (empty? urls)
+              (fallback)
+              (.catch (stream-url-to-file! (first urls) dest)
+                      (fn [_] (try-urls (rest urls))))))]
+    (try-urls (keep :url (:copies entry)))))

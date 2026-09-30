@@ -13,11 +13,13 @@ nbb/kbb, which `require`s the npm SDK directly.
 - Stage 3 (this state): a loopback HTTP service (`server.cljk`, `bin/`) with a
   background drainer, and murakumo's `murakumo.filecoin-tier` client. Verified
   end to end against Filecoin calibration.
+- Streaming: PUT, upload and GET go through the disk, so memory no longer scales
+  with object size (see "Things to know" for measurements).
 - Stage 4: yataverse-distribution archives lake CARs through the service
   (`deploy/filecoin_archive.cljk` there): archive with a receipt, restore with
-  sha-256 verification. Verified on calibration (2 MiB) and in memory (200 MiB).
-- Not yet: batching many small objects into one piece, mainnet, a production
-  sized CAR on real Filecoin, any scheduled archiving.
+  sha-256 verification. Verified on calibration up to 520 MiB.
+- Not yet: batching many small objects into one piece, mainnet, any scheduled
+  archiving.
 
 ## Layout
 
@@ -70,10 +72,11 @@ FILECOIN_CAS_KEY_FILE=~/.filecoin-cas/calibration.key \
 | `FILECOIN_CAS_STATE_DIR` | default `~/.filecoin-cas/state-<chain>` |
 | `FILECOIN_CAS_HOST` / `_PORT` | default `127.0.0.1` / `8788` |
 | `FILECOIN_CAS_TOKEN_FILE` | bearer token (0600); required for a non-loopback host |
-| `FILECOIN_CAS_MAX_OBJECT` | bytes, default 536870912 |
+| `FILECOIN_CAS_MAX_OBJECT` | bytes, default 536870912; Synapse itself refuses a piece over 1,065,353,216 bytes |
 
-`--memory-network` swaps Filecoin for RAM (tests and wiring only; nothing is
-durable).
+`--memory-network` swaps Filecoin for a local directory (`<state-dir>/memnet`)
+that streams files like the real transport (tests and wiring only; nothing is
+durable or provable).
 
 API: `PUT /obj/<cid>` (202 queued, 200 already stored, 400/413/422 on bad
 input), `GET /obj/<cid>` (re-verified bytes, 404 unknown, 502 unverifiable),
@@ -105,6 +108,33 @@ control; never commit it, and prefer a scoped session key over the main key.
   `:spool-corrupt`, `:fetched-bytes-cid-mismatch`, `:no-copies`).
 - A crash between a successful upload and saving the index re-uploads that
   object on the next drain: a duplicate piece, never lost data.
+- Streaming: objects move through the disk, never through memory. A PUT is
+  written to `<state-dir>/spool/.tmp-*` while it is hashed and is renamed into
+  place only once the digest matches the CID; an upload streams the spool file to
+  the SDK (`upload-file!`, a web stream, PieceCID computed as it passes); a GET
+  downloads the stored piece from a stored copy URL into
+  `<state-dir>/fetch/.tmp-*`, verifies it against the CID, and only then streams it
+  to the client (so unverified bytes are never sent). Interrupted transfers'
+  `.tmp-*` files are swept at startup.
+- Measured on Filecoin calibration through the yataverse `archive`/`restore` CLI
+  (sha-256 identical after the round trip; peak sidecar RSS covers both):
+
+  | object | archive to `stored` | restore | peak RSS |
+  |---|---|---|---|
+  | 64 MiB | 352 s | 75 s | 370 MiB |
+  | 256 MiB | 1148 s | 297 s | 470 MiB |
+  | 520 MiB | 2340 s | 629 s | 731 MiB |
+
+  Before streaming the same 64 and 256 MiB runs peaked at 1755 and 4212 MiB, and
+  520 MiB did not finish. Time is dominated by the storage providers (upload,
+  on-chain commit), not by this service. RSS still creeps up with size (about
+  1.4x from 256 to 520 MiB); it is not flat, and larger objects were not measured.
+- Disk, not RAM, is now the resource: budget roughly the object size in the spool
+  while it waits, plus the object size per concurrent GET of an object that is no
+  longer spooled.
+- A PUT for a CID the tier already holds is answered 200/202 without reading the
+  body: the object is identified by its CID and what is stored was verified when
+  it arrived.
 - One object is one piece today, which is wasteful for small objects; batching
   belongs to the archive step (stage 3/4).
 - Synapse keys pieces by PieceCID (CommP), not `baf…` CIDv1. `index.edn` holds

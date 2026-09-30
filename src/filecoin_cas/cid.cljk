@@ -6,6 +6,7 @@
   byte that enters or leaves this tier is re-checked against that CID here.
   Same acceptance rule as murakumo.artifact-store."
   (:require ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
             [multiformats.core :as mf]))
 
 (defn valid-cid? [cid]
@@ -29,6 +30,58 @@
        (let [mh (mf/multihash-sha256 bytes)]
          (or (= cid (mf/cidv1 mf/codec-raw mh))
              (= cid (mf/cidv1 mf/codec-dag-cbor mh))))))
+
+(defn digest->cids
+  "The two CIDv1 strings (raw, dag-cbor) whose sha2-256 multihash is `digest`
+  (32 bytes). Lets a caller that hashed a stream compare without holding the
+  bytes."
+  [digest]
+  (let [mh (js/Uint8Array.from (clj->js (into [0x12 0x20] (array-seq digest))))]
+    #{(mf/cidv1 mf/codec-raw mh) (mf/cidv1 mf/codec-dag-cbor mh)}))
+
+(defn matches-digest?
+  "True when `cid` is the raw or dag-cbor CIDv1 of content whose sha-256 is
+  `digest`."
+  [cid digest]
+  (and (valid-cid? cid) (contains? (digest->cids digest) cid)))
+
+(defn hash-file
+  "Stream `path` through sha-256 without holding it in memory. Promise of
+  {:digest Uint8Array :bytes n}."
+  [path]
+  (js/Promise.
+    (fn [resolve reject]
+      (let [h (.createHash crypto "sha256")
+            n (atom 0)
+            stream (.createReadStream fs path #js {:highWaterMark (* 1024 1024)})]
+        (.on stream "data" (fn [chunk] (swap! n + (.-length chunk)) (.update h chunk)))
+        (.on stream "error" reject)
+        (.on stream "end" #(resolve {:digest (js/Uint8Array. (.digest h)) :bytes @n}))))))
+
+(defn hash-file-sync
+  "Like `hash-file` but blocking, in 1 MiB reads. For startup recovery only."
+  [path]
+  (let [fd (.openSync fs path "r")
+        h (.createHash crypto "sha256")
+        buf (js/Buffer.alloc (* 1024 1024))]
+    (try
+      (loop [total 0]
+        (let [n (.readSync fs fd buf 0 (.-length buf) nil)]
+          (if (zero? n)
+            {:digest (js/Uint8Array. (.digest h)) :bytes total}
+            (do (.update h (.subarray buf 0 n)) (recur (+ total n))))))
+      (finally (.closeSync fs fd)))))
+
+(defn verify-file!
+  "Promise of the byte count when the file at `path` hashes to `cid`; rejects
+  with `reason` (default :cid-mismatch) otherwise."
+  ([cid path] (verify-file! cid path :cid-mismatch))
+  ([cid path reason]
+   (.then (hash-file path)
+          (fn [{:keys [digest bytes]}]
+            (when-not (matches-digest? cid digest)
+              (throw (ex-info (str "filecoin-cas: " (name reason)) {:reason reason :cid cid})))
+            bytes))))
 
 (defn verify!
   "Return `bytes` when they match `cid`; otherwise throw with `reason`

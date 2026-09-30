@@ -13,9 +13,11 @@
                                 (required for a non-loopback host)
     FILECOIN_CAS_MAX_OBJECT     bytes, default 536870912
 
-  --memory-network keeps everything in RAM instead of using Filecoin. It is for
-  tests and local wiring only: nothing is durable."
-  (:require ["node:fs" :as fs]
+  --memory-network replaces Filecoin with a local directory (<state-dir>/memnet)
+  that stands in for it, streaming files like the real transport. It is for
+  tests and local wiring only: nothing is durable or provable."
+  (:require ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
             ["node:os" :as os]
             ["node:path" :as path]
             [promesa.core :as p]
@@ -36,19 +38,28 @@
     (die (str what " file must not be group/other accessible (chmod 600 " file ")")))
   (.trim (.readFileSync fs file "utf8")))
 
-(defn- memory-transport []
-  (let [pieces (atom {}) n (atom 0)]
-    {:upload! (fn [bytes _]
-                (let [pc (str "mem-" (swap! n inc))]
-                  (swap! pieces assoc pc bytes)
-                  (p/resolved {:piece-cid pc :complete? true :copies [{:provider-id "mem"}]})))
-     :download (fn [pc] (p/resolved (get @pieces pc)))}))
+(defn- memory-transport
+  "Stand-in for Filecoin: pieces are files under <dir>/memnet, copied in and
+  out. No Filecoin, no wallet; streams like the real transport."
+  [dir]
+  (let [pdir (.join path dir "memnet")]
+    (.mkdirSync fs pdir #js {:recursive true})
+    {:upload-file! (fn [file size _meta]
+                     (let [pc (str "mem-" (.randomUUID crypto))]
+                       (.copyFileSync fs file (.join path pdir pc))
+                       (p/resolved {:piece-cid pc :size size :complete? true
+                                    :copies [{:provider-id "mem"}]})))
+     :download-file! (fn [entry dest]
+                       (.copyFileSync fs (.join path pdir (:piece-cid entry)) dest)
+                       (p/resolved nil))}))
 
 (defn- synapse-transport [chain key]
   (let [synapse (fc/make-synapse {:chain chain :private-key key :source "filecoin-cas"})]
     {:synapse synapse
      :upload! (fn [b m] (fc/upload! synapse b m))
-     :download (fn [pc] (fc/download synapse pc))}))
+     :upload-file! (fn [file size m] (fc/upload-file! synapse file size m))
+     :download (fn [pc] (fc/download synapse pc))
+     :download-file! (fn [entry dest] (fc/download-to-file! synapse entry dest))}))
 
 (defn -main [args]
   (let [memory? (some #{"--memory-network"} args)
@@ -58,16 +69,17 @@
             (die "mainnet uses real funds: set FILECOIN_CAS_ALLOW_MAINNET=1 to proceed"))
         key-file (env "FILECOIN_CAS_KEY_FILE")
         _ (when (and (not memory?) (not key-file)) (die "FILECOIN_CAS_KEY_FILE is required"))
-        transport (if memory?
-                    (memory-transport)
-                    (synapse-transport chain (read-secret-file key-file "key")))
-        token (some-> (env "FILECOIN_CAS_TOKEN_FILE") (read-secret-file "token"))
         dir (or (env "FILECOIN_CAS_STATE_DIR")
                 (.join path (.homedir os) ".filecoin-cas" (str "state-" (name chain))))
+        transport (if memory?
+                    (memory-transport dir)
+                    (synapse-transport chain (read-secret-file key-file "key")))
+        token (some-> (env "FILECOIN_CAS_TOKEN_FILE") (read-secret-file "token"))
         host (or (env "FILECOIN_CAS_HOST") "127.0.0.1")
         port (js/Number (or (env "FILECOIN_CAS_PORT") "8788"))
         _ (cid/install-fast-sha256!)
-        cas (eng/open (assoc (select-keys transport [:upload! :download]) :dir dir))
+        cas (eng/open (assoc (select-keys transport [:upload! :upload-file! :download :download-file!])
+                             :dir dir))
         drainer (srv/start-drainer!
                   cas {:before-drain (when-let [s (:synapse transport)]
                                        (fn [sizes] (fc/prepare! s sizes)))})]
